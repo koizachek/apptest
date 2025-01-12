@@ -1,160 +1,106 @@
 import streamlit as st
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from typing import List, TypedDict, Annotated
-from pydantic import BaseModel, Field
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_community.document_loaders import WikipediaLoader
-from langchain_core.messages import get_buffer_string
-import operator
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import google.generativeai as genai
+from langchain.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
 
-# Define the Analyst model
-class Analyst(BaseModel):
-    affiliation: str = Field(description="Primary affiliation of the analyst.")
-    name: str = Field(description="Name of the analyst.")
-    role: str = Field(description="Role of the analyst in the context of the topic.")
-    description: str = Field(description="Description of the analyst focus, concerns, and motives.")
+load_dotenv()
+os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Define the ResearchGraphState
-class ResearchGraphState(TypedDict):
-    topic: str
-    max_analysts: int
-    human_analyst_feedback: str
-    analysts: List[Analyst]
-    sections: Annotated[list, operator.add]
-    introduction: str
-    content: str
-    conclusion: str
-    final_report: str
 
-# Define the builder for the state graph
-def create_builder():
-    builder = StateGraph(ResearchGraphState)
-    builder.add_node("create_analysts", create_analysts)
-    builder.add_node("human_feedback", human_feedback)
-    builder.add_node("conduct_interview", conduct_interview)
-    builder.add_node("write_report", write_report)
-    builder.add_node("write_introduction", write_introduction)
-    builder.add_node("write_conclusion", write_conclusion)
-    builder.add_node("finalize_report", finalize_report)
 
-    # Logic
-    builder.add_edge(START, "create_analysts")
-    builder.add_edge("create_analysts", "human_feedback")
-    builder.add_conditional_edges("human_feedback", initiate_all_interviews, ["create_analysts", "conduct_interview"])
-    builder.add_edge("conduct_interview", "write_report")
-    builder.add_edge("conduct_interview", "write_introduction")
-    builder.add_edge("conduct_interview", "write_conclusion")
-    builder.add_edge(["write_conclusion", "write_report", "write_introduction"], "finalize_report")
-    builder.add_edge("finalize_report", END)
 
-    return builder
 
-# Placeholder functions for the nodes
-def create_analysts(state: ResearchGraphState):
-    # Logic to create analysts
-    return state
 
-def human_feedback(state: ResearchGraphState):
-    # Logic to handle human feedback
-    return state
+def get_pdf_text(pdf_docs):
+    text=""
+    for pdf in pdf_docs:
+        pdf_reader= PdfReader(pdf)
+        for page in pdf_reader.pages:
+            text+= page.extract_text()
+    return  text
 
-def conduct_interview(state: ResearchGraphState):
-    # Logic to conduct interviews
-    return state
 
-def write_report(state: ResearchGraphState):
-    # Logic to write the report
-    return state
 
-def write_introduction(state: ResearchGraphState):
-    # Logic to write the introduction
-    return state
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
-def write_conclusion(state: ResearchGraphState):
-    # Logic to write the conclusion
-    return state
 
-def finalize_report(state: ResearchGraphState):
-    # Logic to finalize the report
-    return state
+def get_vector_store(text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
 
-def initiate_all_interviews(state: ResearchGraphState):
-    # Logic to initiate all interviews
-    return state
+
+def get_conversational_chain():
+
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
+    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
+    Context:\n {context}?\n
+    Question: \n{question}\n
+
+    Answer:
+    """
+
+    model = ChatGoogleGenerativeAI(model="gemini-pro",
+                             temperature=0.3)
+
+    prompt = PromptTemplate(template = prompt_template, input_variables = ["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    return chain
+
+
+
+def user_input(user_question):
+    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
+    
+    new_db = FAISS.load_local("faiss_index", embeddings)
+    docs = new_db.similarity_search(user_question)
+
+    chain = get_conversational_chain()
+
+    
+    response = chain(
+        {"input_documents":docs, "question": user_question}
+        , return_only_outputs=True)
+
+    print(response)
+    st.write("Reply: ", response["output_text"])
+
+
+
 
 def main():
-    st.title("Research Assistant with Streamlit")
+    st.set_page_config("Chat PDF")
+    st.header("Chat with PDF using Gemini💁")
 
-    # Input fields for API keys
-    openai_api_key = st.text_input("Enter your OpenAI API Key:", type="password")
-    tavily_api_key = st.text_input("Enter your Tavily API Key:", type="password")
+    user_question = st.text_input("Ask a Question from the PDF Files")
 
-    # Input fields for research topic and number of analysts
-    topic = st.text_input("Enter the research topic:")
-    max_analysts = st.number_input("Enter the number of analysts:", min_value=1, value=3)
+    if user_question:
+        user_input(user_question)
 
-    # Additional field to add another analyst
-    additional_analyst = st.text_input("Add another analyst (optional):")
+    with st.sidebar:
+        st.title("Menu:")
+        pdf_docs = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True)
+        if st.button("Submit & Process"):
+            with st.spinner("Processing..."):
+                raw_text = get_pdf_text(pdf_docs)
+                text_chunks = get_text_chunks(raw_text)
+                get_vector_store(text_chunks)
+                st.success("Done")
 
-    # Button to start the research
-    if st.button("Start Research"):
-        if not openai_api_key or not tavily_api_key:
-            st.error("Please enter both OpenAI and Tavily API keys.")
-            return
 
-        # Set environment variables for API keys
-        os.environ["OPENAI_API_KEY"] = openai_api_key
-        os.environ["TAVILY_API_KEY"] = tavily_api_key
 
-        # Initialize the LLM
-        llm = ChatOpenAI(model="gpt-4", temperature=0)
-
-        # Create analysts
-        analysts = [
-            Analyst(
-                affiliation="Interactive Design Studio",
-                name="Sophie Lin",
-                role="Interaction Designer",
-                description="Sophie designs user interfaces and experiences for AI systems in smart cities. Her focus is on creating intuitive and accessible interactions between citizens and AI technologies, ensuring that these systems are user-friendly and enhance the quality of urban life."
-            )
-        ]
-
-        if additional_analyst:
-            analysts.append(Analyst(
-                affiliation="Custom Affiliation",
-                name="Custom Analyst",
-                role="Custom Role",
-                description=additional_analyst
-            ))
-
-        # Initialize the state
-        state = ResearchGraphState(
-            topic=topic,
-            max_analysts=max_analysts,
-            human_analyst_feedback="",
-            analysts=analysts,
-            sections=[],
-            introduction="",
-            content="",
-            conclusion="",
-            final_report=""
-        )
-
-        # Create the builder and compile the graph
-        builder = create_builder()
-        memory = MemorySaver()
-        graph = builder.compile(checkpointer=memory)
-
-        # Define a unique thread_id for the graph execution
-        thread_id = "research_thread_1"
-
-        # Run the research graph with the configurable dictionary
-        result = graph.invoke(state, {"configurable": {"thread_id": thread_id}})
-
-        # Display the final report
-        st.markdown("### Final Report")
-        st.markdown(result["final_report"])
+if __name__ == "__main__":
+    main()
